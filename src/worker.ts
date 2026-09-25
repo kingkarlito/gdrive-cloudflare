@@ -1,0 +1,942 @@
+var config: AppConfig = {
+    client_id: '202264815644.apps.googleusercontent.com', // Google API Client ID
+    client_secret: 'X4Z3ca8xfWDb1Voo-F9a7ZxJ', // Google API Client Secret
+    refresh_token: '', // Google Drive API Refresh Token
+
+    path: '/dav/',
+    name: 'My Cloud Drive', // Display name for the web interface
+    copyright: '@ixiumu', // Copyright text displayed in the footer
+    copyright_link: 'https://github.com/ixiumu/google-drive-webdav-workers', // URL link for the footer
+
+    users: {
+        'user': 'password' // Global Authentication credentials (username: password)
+    },
+
+    env: false,
+    working_dir: '/', // Root directory path for the drive mapping
+    cache: {
+        meta: {
+            '/': { data: { id: 'root', mimeType: 'application/vnd.google-apps.folder', size: 0, modifiedTime: null }, expire: Infinity }
+        },
+        putUrl: {},
+        config: {}
+    }
+};
+
+if (typeof CONFIG !== 'undefined') Object.assign(config, CONFIG);
+
+const pathJoin = (...args: string[]): string => args.join('/').replace(/\\/g, '/').replace(/(?<!^)\/+/g, '/').replace(/\/\//g, '/');
+const encodeQueryString = (data: Record<string, string>): string => Object.keys(data).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(data[k])).join('&');
+const trimString = (string: string, char?: string): string => char ? string.replace(new RegExp('^\\' + char + '+|\\' + char + '+$', 'g'), '') : string.replace(/^\s+|\s+$/g, '');
+const formatSize = (n: number | string): string => {
+    let num = typeof n === 'string' ? parseFloat(n) : Math.round(n);
+    if (num === 0 || isNaN(num)) return '';
+    if (num < 1024) return num + 'B'; if (num < 1024 * 1024) return Math.round(num / 1024) + 'K';
+    return parseFloat((num / 1024 / 1024).toFixed(1)) + 'M';
+};
+
+const getUrl = (url: string): { rpath: string; fpath: string } => {
+    const rpath = decodeURIComponent(new URL(url, 'http://localhost').pathname);
+    let fpath_relative = rpath;
+    const basePath = config.path.endsWith('/') ? config.path : config.path + '/';
+    if (basePath !== '/' && fpath_relative.startsWith(basePath)) {
+        fpath_relative = '/' + fpath_relative.substring(basePath.length);
+    }
+    return {
+        rpath,
+        fpath: pathJoin(config.working_dir, fpath_relative)
+    };
+};
+
+function basicAuthentication(request: Request): { user: string; pass: string } | null {
+    const Authorization = request.headers.get('Authorization');
+    if (!Authorization) return null;
+    const [scheme, encoded] = Authorization.split(' ');
+    if (!encoded || scheme !== 'Basic') return null;
+    const buffer = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+    const decoded = new TextDecoder().decode(buffer).normalize();
+    const index = decoded.indexOf(':');
+    if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) return null;
+    return { user: decoded.substring(0, index), pass: decoded.substring(index + 1) };
+}
+
+class KVCache {
+    env: Env;
+    ctx: ExecutionContext;
+
+    constructor(env: Env, ctx: ExecutionContext) {
+        this.env = env;
+        this.ctx = ctx;
+    }
+
+    async get(k: string, ns: string): Promise<any> {
+        const now = Date.now();
+        if (config.cache[ns] && config.cache[ns]![k]) {
+            if (config.cache[ns]![k].expire > now) {
+                return config.cache[ns]![k].data;
+            }
+        }
+        if (this.env && this.env.KV) {
+            const v = await this.env.KV.get(ns + '.' + k, { type: 'json' });
+            if (v) {
+                if (!config.cache[ns]) config.cache[ns] = {};
+                config.cache[ns]![k] = { data: v, expire: now + 300000 };
+                return v;
+            }
+        }
+        return null;
+    }
+
+    async put(k: string, v: any, ns: string, customTtl?: number): Promise<void> {
+        if (v) {
+            if (!config.cache[ns]) config.cache[ns] = {};
+            const ttl = customTtl || 300000;
+            config.cache[ns]![k] = { data: v, expire: Date.now() + ttl };
+            if (this.env && this.env.KV && this.ctx) {
+                const kvPromise = this.env.KV.put(ns + '.' + k, JSON.stringify(v), { expirationTtl: Math.max(60, Math.floor(ttl / 1000)) });
+                if (ns === 'tus_session') {
+                    await kvPromise;
+                } else {
+                    this.ctx.waitUntil(kvPromise);
+                }
+            }
+        }
+    }
+
+    async delete(k: string, ns: string): Promise<void> {
+        if (ns === 'meta' && !k.endsWith('/')) k += '/';
+        if (ns === 'meta' && k === '/') return;
+        if (config.cache[ns] && config.cache[ns]![k]) {
+            delete config.cache[ns]![k];
+        }
+        if (this.env && this.env.KV && this.ctx) {
+            this.ctx.waitUntil(this.env.KV.delete(ns + '.' + k));
+        }
+    }
+
+    async invalidateFileAndParent(fpath: string): Promise<void> {
+        await this.delete(fpath, 'meta');
+        const tok = fpath.split('/');
+        tok.pop();
+        const parent = tok.join('/');
+        await this.delete(parent, 'meta');
+    }
+}
+
+class StatusError extends Error {
+    status: number;
+    code?: number;
+
+    constructor(message: string, status: number) {
+        super(message);
+        this.status = status;
+    }
+}
+
+class GDrive {
+    cache: KVCache;
+    static fetchingTokenPromise: Promise<string> | null = null;
+
+    constructor(env: Env, ctx: ExecutionContext<unknown>) {
+        this.cache = new KVCache(env, ctx);
+    }
+
+    async OPTIONS(request: Request): Promise<Response> {
+        let allowed_methods = ['GET', 'HEAD', 'OPTIONS', 'PUT', 'PROPFIND', 'MKCOL', 'DELETE', 'MOVE', 'COPY'].join(',');
+        return new Response(null, { status: 200, headers: { 'Allow': allowed_methods, 'DAV': '1, 2, 3', 'MS-Author-Via': 'DAV', 'Accept-Ranges': 'bytes' } });
+    }
+
+    async PROPFIND(request: Request): Promise<Response> {
+        let { rpath, fpath } = getUrl(request.url);
+        const metadata = await this.getMetadata(fpath);
+        if (!metadata) return new Response(null, { status: 404 });
+
+        let content: string;
+        if (metadata.mimeType === 'application/vnd.google-apps.folder') {
+            const depth = request.headers.get('Depth');
+            if (depth && depth === '1') {
+                const objects = await this.getObjects(metadata.id);
+                let files: Partial<DriveFile>[] = [];
+                for (let i = 0; i < objects.length; i++) {
+                    let object = objects[i];
+                    files.push({ name: object.name, dir: object.mimeType === 'application/vnd.google-apps.folder', lastmodified: new Date(object.modifiedTime).toUTCString(), size: object.size ? object.size : 0 });
+                }
+                content = arrayToXml(rpath, [{ name: '', dir: true, lastmodified: null, size: 0 }, ...(files || [])], '');
+            } else {
+                content = arrayToXml(rpath, [{ name: '', dir: true, lastmodified: new Date(metadata.modifiedTime).toUTCString(), size: metadata.size, quota: fpath === '/' ? await this.getQuota() : null }]);
+            }
+        } else {
+            content = arrayToXml(rpath, [{ name: '', dir: false, lastmodified: new Date(metadata.modifiedTime).toUTCString(), size: metadata.size }]);
+        }
+        return new Response(content, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
+    }
+
+    async MKCOL(request: Request): Promise<Response> {
+        let { rpath, fpath } = getUrl(request.url);
+        if (fpath.slice(-1) === '/') fpath = fpath.slice(0, -1);
+
+        let metadata = await this.getMetadata(fpath);
+        if (metadata) return new Response('<d:error xmlns:d="DAV:" xmlns:td="https://www.contoso.com/schema/"><td:exception>MethodNotAllowed</td:exception><td:message>The resource you tried to create already exists</td:message></d:error>', { status: 405 });
+
+        const tok = fpath.split('/'); const name = tok.pop()!; const parent = tok.join('/');
+        let parentMetadata = await this.getMetadata(parent);
+        if (!parentMetadata) return new Response(null, { status: 404 });
+
+        let response = await fetch(new Request('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true', {
+            body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parentMetadata.id] }),
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=UTF-8', Authorization: 'Bearer ' + (await this.getAccessToken()) }
+        }));
+
+        if (response.ok) {
+            await this.cache.invalidateFileAndParent(fpath);
+            await this.cache.delete(parentMetadata.id, 'objects');
+            return new Response(null, { status: 201 });
+        }
+        return new Response(null, { status: 422 });
+    }
+
+    async GET(request: Request): Promise<Response> {
+        let { rpath, fpath } = getUrl(request.url);
+        let url = new URL(request.url);
+        let response: Response;
+        const metadata = await this.getMetadata(fpath);
+        if (metadata) {
+            try {
+                if (metadata.mimeType === 'application/vnd.google-apps.folder') {
+                    const objects = await this.getObjects(metadata.id);
+                    let files: Partial<DriveFile>[] = [];
+                    for (let i = 0; i < objects.length; i++) {
+                        let object = objects[i];
+                        files.push({ name: trimString(object.name, '/'), dir: object.mimeType === 'application/vnd.google-apps.folder', lastmodified: new Date(object.modifiedTime).toISOString().split('T')[0], size: object.size ? object.size : 0, iconLink: object.iconLink });
+                    }
+                    return new Response(arrayToHtml(rpath, files), { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+                }
+                if (metadata.mimeType.startsWith('image/')) {
+                    const tempLink = metadata.thumbnailLink.replace(/=s\d+$/, '');
+                    const rawParam = url.searchParams.get('param');
+                    const paramSuffix = rawParam ? `=${rawParam}` : '=s0';
+                    return await fetch(new Request(tempLink + paramSuffix, request));
+                }
+                const abuse = url.searchParams.get('abuse') === 'true';
+                const range = request.headers.get('Range');
+                response = await this.getRawContent(metadata.id, range, abuse);
+                if (response.status >= 400) {
+                    const result: any = await response.json();
+                    if (!abuse && response.status === 403 && result.error.errors[0].reason === 'cannotDownloadAbusiveFile') {
+                        return Response.redirect(url.origin + url.pathname + '?abuse=true', 302);
+                    }
+                    throw new StatusError(result.error.message, response.status);
+                }
+            } catch (e: any) { return new Response(e.message, { status: 500 }); }
+        } else { response = new Response(null, { status: 404 }); }
+        return response;
+    }
+
+    async POST(request: Request): Promise<Response> {
+        if (request.headers.has('Tus-Resumable')) {
+            let { rpath, fpath } = getUrl(request.url);
+            const totalSize = parseInt(request.headers.get('Upload-Length') || '0', 10);
+            let mimeType = 'application/octet-stream';
+            let targetPath = fpath;
+
+            const metaHeader = request.headers.get('Upload-Metadata');
+            if (metaHeader) {
+                const typeMatch = metaHeader.match(/filetype\s+([A-Za-z0-9+/=]+)/);
+                if (typeMatch) mimeType = atob(typeMatch[1]);
+                const nameMatch = metaHeader.match(/filename\s+([A-Za-z0-9+/=]+)/);
+                if (nameMatch) {
+                    const binString = atob(nameMatch[1]);
+                    const bytes = Uint8Array.from(binString, c => c.charCodeAt(0));
+                    const filename = new TextDecoder().decode(bytes);
+                    targetPath = pathJoin(fpath, filename);
+                }
+            }
+
+            const tok = targetPath.split('/'); const name = tok.pop()!; const parent = tok.join('/');
+            let parentMetadata = await this.getMetadata(parent);
+            if (!parentMetadata) return new Response('Parent folder not found', { status: 404 });
+
+            const metadata = await this.getMetadata(targetPath);
+            const existingFileId = metadata?.id || null;
+
+            const api = 'https://www.googleapis.com/upload/drive/v3/files';
+            const initUrl = existingFileId ? `${api}/${existingFileId}?uploadType=resumable` : `${api}?uploadType=resumable`;
+            const initMethod = existingFileId ? 'PATCH' : 'POST';
+            const initBody = existingFileId ? '{}' : JSON.stringify({ name, parents: [parentMetadata.id], mimeType });
+
+            const headers: any = {
+                'Content-Type': 'application/json',
+                'X-Upload-Content-Type': mimeType,
+                Authorization: 'Bearer ' + (await this.getAccessToken())
+            };
+            if (totalSize > 0) headers['X-Upload-Content-Length'] = totalSize.toString();
+
+            const response = await fetch(initUrl, { method: initMethod, headers, body: initBody });
+            const uploadUrl = response.headers.get('Location');
+            if (!uploadUrl) {
+                const errText = await response.text();
+                console.error('GDrive TUS init failed. Status:', response.status, 'Response:', errText);
+                return new Response(`Failed to get GDrive resumable URL`, { status: 500 });
+            }
+
+            const sessionId = crypto.randomUUID();
+            const sessionData = { uploadUrl, totalSize, targetPath, parentId: parentMetadata.id, existingFileId };
+            await this.cache.put(sessionId, sessionData, 'tus_session', 86400000);
+
+            const reqUrl = new URL(request.url);
+            let basePath = config.path.endsWith('/') ? config.path : config.path + '/';
+            const tusLocation = `${reqUrl.origin}${basePath}tus_uploads/${sessionId}`;
+
+            return new Response(null, {
+                status: 201,
+                headers: {
+                    'Tus-Resumable': '1.0.0',
+                    'Location': tusLocation,
+                    'Tus-Extension': 'creation,creation-with-upload',
+                    'Access-Control-Expose-Headers': 'Location, Tus-Resumable, Tus-Extension',
+                }
+            });
+        }
+        return new Response('Method Not Allowed', { status: 405 });
+    }
+
+    async PATCH(request: Request): Promise<Response> {
+        let url = new URL(request.url);
+
+        if (url.pathname.includes('/tus_uploads/')) {
+            const sessionId = url.pathname.split('/').pop()!;
+            const session = await this.cache.get(sessionId, 'tus_session');
+
+            if (!session) return new Response('Session Not Found', { status: 404 });
+
+            const offset = parseInt(request.headers.get('Upload-Offset') || '0', 10);
+            const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+            const end = offset + contentLength - 1;
+            const rangeTotal = session.totalSize > 0 ? session.totalSize.toString() : '*';
+
+            const res = await fetch(session.uploadUrl, {
+                method: 'PUT',
+                headers: {
+                    'Content-Length': `${contentLength}`,
+                    'Content-Range': `bytes ${offset}-${end}/${rangeTotal}`
+                },
+                body: request.body,
+                // @ts-ignore
+                duplex: 'half'
+            });
+
+            if (res.status === 308) {
+                return new Response(null, {
+                    status: 204,
+                    headers: { 'Tus-Resumable': '1.0.0', 'Upload-Offset': (offset + contentLength).toString() }
+                });
+            } else if (res.status === 200 || res.status === 201) {
+                await this.cache.delete(sessionId, 'tus_session');
+                await this.cache.invalidateFileAndParent(session.targetPath);
+                if (!session.existingFileId) await this.cache.delete(session.parentId, 'objects');
+
+                return new Response(null, {
+                    status: 204,
+                    headers: { 'Tus-Resumable': '1.0.0', 'Upload-Offset': (offset + contentLength).toString() }
+                });
+            }
+            return new Response(`Chunk upload failed: ${await res.text()}`, { status: 500 });
+        }
+        return new Response('Method Not Allowed', { status: 405 });
+    }
+
+    async PUT(request: Request): Promise<Response> {
+        let { fpath } = getUrl(request.url);
+        if (fpath.slice(-1) === '/') return new Response(null, { status: 405 });
+        const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+        const mimeType = request.headers.get('Content-Type') || 'application/octet-stream';
+
+        const tok = fpath.split('/'); const name = tok.pop()!; const parent = tok.join('/');
+        let parentMetadata = await this.getMetadata(parent);
+        if (!parentMetadata) return new Response(null, { status: 404 });
+        const metadata = await this.getMetadata(fpath);
+        const existingFileId = metadata?.id || null;
+        const api = 'https://www.googleapis.com/upload/drive/v3/files';
+        if (contentLength === 0 || !request.body) {
+            const initUrl = existingFileId ? `https://www.googleapis.com/drive/v3/files/${existingFileId}` : `https://www.googleapis.com/drive/v3/files`;
+            const initMethod = existingFileId ? 'PATCH' : 'POST';
+            const body = existingFileId ? '{}' : JSON.stringify({ name, parents: [parentMetadata.id], mimeType });
+            const response = await fetch(initUrl, {
+                method: initMethod,
+                headers: { 'Content-Type': 'application/json; charset=UTF-8', Authorization: 'Bearer ' + (await this.getAccessToken()) },
+                body
+            });
+            if (response.ok) {
+                await this.cache.invalidateFileAndParent(fpath);
+                if (!existingFileId) await this.cache.delete(parentMetadata.id, 'objects');
+                return new Response(null, { status: existingFileId ? 204 : 201 });
+            }
+            return new Response(null, { status: response.status });
+        }
+        if (contentLength <= 5 * 1024 * 1024) {
+            const reader = request.body.getReader();
+            if (existingFileId) {
+                // @ts-ignore
+                const { readable, writable } = new FixedLengthStream(contentLength);
+                const writer = writable.getWriter();
+                const uploadPromise = fetch(`${api}/${existingFileId}?uploadType=media`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': mimeType, Authorization: 'Bearer ' + (await this.getAccessToken()) },
+                    body: readable,
+                    // @ts-ignore
+                    duplex: 'half'
+                });
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        await writer.write(value);
+                    }
+                    await writer.close();
+                } catch (err) { try { await reader.cancel(); } catch (e) { } await writer.abort(err); } finally { reader.releaseLock(); }
+                const res = await uploadPromise;
+                if (res.ok) {
+                    await this.cache.invalidateFileAndParent(fpath);
+                    return new Response(null, { status: 204 });
+                }
+                return new Response(await res.text(), { status: res.status });
+            } else {
+                const boundary = '-------webdav_boundary';
+                const fileMetadata = JSON.stringify({ name: name, parents: [parentMetadata.id], mimeType: mimeType });
+                const encoder = new TextEncoder();
+                const preArray = encoder.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${fileMetadata}\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`);
+                const postArray = encoder.encode(`\r\n--${boundary}--`);
+                const totalLength = preArray.byteLength + contentLength + postArray.byteLength;
+                const { readable, writable } = new FixedLengthStream(totalLength);
+                const writer = writable.getWriter();
+                const uploadPromise = fetch(`${api}?uploadType=multipart`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': `multipart/related; boundary=${boundary}`, Authorization: 'Bearer ' + (await this.getAccessToken()) },
+                    body: readable,
+                    // @ts-ignore
+                    duplex: 'half'
+                });
+
+                try {
+                    await writer.write(preArray);
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        await writer.write(value);
+                    }
+                    await writer.write(postArray);
+                    await writer.close();
+                } catch (err) { try { await reader.cancel(); } catch (e) { } await writer.abort(err); } finally { reader.releaseLock(); }
+
+                const res = await uploadPromise;
+                if (res.ok) {
+                    await this.cache.invalidateFileAndParent(fpath);
+                    await this.cache.delete(parentMetadata.id, 'objects');
+                    return new Response(null, { status: 201 });
+                }
+                return new Response(await res.text(), { status: res.status });
+            }
+        }
+
+        const initUrl = existingFileId ? `${api}/${existingFileId}?uploadType=resumable` : `${api}?uploadType=resumable`;
+        const initMethod = existingFileId ? 'PATCH' : 'POST';
+        const initBody = existingFileId ? '{}' : JSON.stringify({ name, parents: [parentMetadata.id], mimeType });
+
+        const initRes = await fetch(initUrl, {
+            method: initMethod,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Upload-Content-Type': mimeType,
+                'X-Upload-Content-Length': contentLength.toString(),
+                Authorization: 'Bearer ' + (await this.getAccessToken())
+            },
+            body: initBody
+        });
+
+        const uploadUrl = initRes.headers.get('Location');
+        if (!uploadUrl) return new Response('Failed to get Resumable Upload URL', { status: 500 });
+
+        const reader = request.body.getReader();
+        const CHUNK_SIZE = 10 * 1024 * 1024;
+        let offset = 0;
+        let residualBuffer: Uint8Array | null = null;
+        let finalStatus = 200;
+
+        try {
+            while (offset < contentLength) {
+                const currentChunkSize = Math.min(CHUNK_SIZE, contentLength - offset);
+                // @ts-ignore
+                const { readable, writable } = new FixedLengthStream(currentChunkSize);
+                const writer = writable.getWriter();
+
+                const uploadPromise = fetch(uploadUrl, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Length': `${currentChunkSize}`,
+                        'Content-Range': `bytes ${offset}-${offset + currentChunkSize - 1}/${contentLength}`
+                    },
+                    body: readable,
+                    // @ts-ignore
+                    duplex: 'half'
+                });
+
+                let bytesSentInChunk = 0;
+                while (bytesSentInChunk < currentChunkSize) {
+                    let data: Uint8Array;
+                    if (residualBuffer) {
+                        data = residualBuffer;
+                        residualBuffer = null;
+                    } else {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        data = value;
+                    }
+
+                    const remaining = currentChunkSize - bytesSentInChunk;
+                    if (data.length <= remaining) {
+                        await writer.write(data);
+                        bytesSentInChunk += data.length;
+                    } else {
+                        await writer.write(data.subarray(0, remaining));
+                        residualBuffer = data.subarray(remaining);
+                        bytesSentInChunk += remaining;
+                    }
+                }
+                await writer.close();
+                const chunkRes = await uploadPromise;
+
+                if (chunkRes.status === 308) {
+                } else if (chunkRes.status === 200 || chunkRes.status === 201) {
+                    finalStatus = chunkRes.status;
+                } else {
+                    throw new Error(`Google Drive chunk failed: ${await chunkRes.text()}`);
+                }
+                offset += currentChunkSize;
+            }
+
+            await this.cache.invalidateFileAndParent(fpath);
+            if (!existingFileId) await this.cache.delete(parentMetadata.id, 'objects');
+            return new Response(null, { status: finalStatus <= 201 ? 201 : 204 });
+
+        } catch (err: any) {
+            console.error('Upload Failed:', err);
+            try { await reader.cancel(); } catch (e) { }
+            return new Response('Upload Failed', { status: 500 });
+        } finally {
+            if (reader) reader.releaseLock();
+        }
+    }
+
+    async MOVE(request: Request): Promise<Response | undefined> {
+        let { fpath } = getUrl(request.url);
+        if (fpath === '/') return new Response(null, { status: 403 });
+        let destination = request.headers.get('Destination');
+        if (!destination) return new Response(null, { status: 403 });
+        const { fpath: dest_fpath } = getUrl(destination);
+        const metadata = await this.getMetadata(fpath);
+        if (!metadata) return new Response(null, { status: 404 });
+
+        const tok = fpath.split('/'); const name = tok.pop()!; const parent = tok.join('/');
+        const dest_tok = dest_fpath.split('/'); const dest_name = dest_tok.pop()!; const dest_parent = dest_tok.join('/');
+
+        let patchUrl: string | undefined;
+        let originalParentId = metadata.parents && metadata.parents.length > 0 ? metadata.parents[0] : null;
+        let destParentId = originalParentId;
+
+        if (dest_parent !== parent) {
+            const dest_metadata = await this.getMetadata(dest_parent);
+            if (!dest_metadata) return new Response(null, { status: 404 });
+            destParentId = dest_metadata.id;
+            let parentsArray = [...metadata.parents];
+            patchUrl = 'removeParents=' + parentsArray.pop() + '&addParents=' + destParentId;
+        }
+
+        const response = await fetch('https://www.googleapis.com/drive/v3/files/' + metadata.id + '?supportsAllDrives=true&' + (patchUrl || ''), {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json; charset=UTF-8', Authorization: 'Bearer ' + (await this.getAccessToken()) },
+            body: name !== dest_name ? JSON.stringify({ name: dest_name }) : null
+        });
+
+        const result: any = await response.json();
+        if (result.id) {
+            await this.cache.invalidateFileAndParent(fpath);
+            await this.cache.delete(dest_parent, 'meta');
+
+            if (originalParentId) await this.cache.delete(originalParentId, 'objects');
+            if (destParentId && destParentId !== originalParentId) await this.cache.delete(destParentId, 'objects');
+
+            return new Response(null, { status: 201, headers: { 'Location': destination } });
+        }
+    }
+
+    async COPY(request: Request): Promise<Response> {
+        let { fpath } = getUrl(request.url);
+        let destination = request.headers.get('Destination');
+        if (!destination) return new Response(null, { status: 403 });
+        const { fpath: dest_fpath } = getUrl(destination);
+        if (dest_fpath === '/') return new Response(null, { status: 403 });
+        const metadata = await this.getMetadata(fpath);
+        if (!metadata) return new Response(null, { status: 404 });
+        const tok = fpath.split('/'); const name = tok.pop()!; const parent = tok.join('/');
+        const dest_tok = dest_fpath.split('/'); const dest_name = dest_tok.pop()!; const dest_parent = dest_tok.join('/');
+
+        let parents = metadata.parents;
+        let destParentId = null;
+
+        if (dest_parent !== parent) {
+            const dest_metadata = await this.getMetadata(dest_parent);
+            if (!dest_metadata) return new Response(null, { status: 404 });
+            destParentId = dest_metadata.id;
+            parents = [destParentId];
+        } else {
+            destParentId = metadata.parents && metadata.parents.length > 0 ? metadata.parents[0] : null;
+        }
+
+        await fetch('https://www.googleapis.com/drive/v3/files/' + metadata.id + '/copy?supportsAllDrives=true', {
+            method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8', Authorization: 'Bearer ' + (await this.getAccessToken()) },
+            body: JSON.stringify({ name: dest_name, parents: parents })
+        });
+
+        await this.cache.delete(dest_parent, 'meta');
+        if (destParentId) await this.cache.delete(destParentId, 'objects');
+
+        return new Response(null, { status: 201 });
+    }
+
+    async DELETE(request: Request): Promise<Response> {
+        let { fpath } = getUrl(request.url);
+        if (fpath === '/') return new Response(null, { status: 403 });
+        const metadata = await this.getMetadata(fpath);
+        if (metadata) {
+            const response = await fetch('https://www.googleapis.com/drive/v3/files/' + metadata.id + '?supportsAllDrives=true', { method: 'DELETE', headers: { Authorization: 'Bearer ' + (await this.getAccessToken()) } });
+
+            await this.cache.invalidateFileAndParent(fpath);
+            if (metadata.parents && metadata.parents.length > 0) {
+                await this.cache.delete(metadata.parents[0], 'objects');
+            }
+            return new Response(null, { status: response.status });
+        }
+        return new Response(null, { status: 404 });
+    }
+
+    async HEAD(request: Request): Promise<Response> {
+        let url = new URL(request.url);
+        if (url.pathname.includes('/tus_uploads/')) {
+            const sessionId = url.pathname.split('/').pop()!;
+            const session = await this.cache.get(sessionId, 'tus_session');
+            if (!session) return new Response('Session Not Found', { status: 404 });
+            const rangeTotal = session.totalSize > 0 ? session.totalSize.toString() : '*';
+            const res = await fetch(session.uploadUrl, {
+                method: 'PUT',
+                headers: {
+                    'Content-Length': '0',
+                    'Content-Range': `bytes */${rangeTotal}`
+                }
+            });
+
+            let currentOffset = 0;
+            if (res.status === 308) {
+                const rangeHeader = res.headers.get('Range');
+                if (rangeHeader) {
+                    const parts = rangeHeader.split('-');
+                    currentOffset = parseInt(parts[1], 10) + 1;
+                }
+            } else if (res.status === 200 || res.status === 201) {
+                currentOffset = session.totalSize;
+            }
+
+            return new Response(null, {
+                status: 200,
+                headers: {
+                    'Tus-Resumable': '1.0.0',
+                    'Upload-Offset': currentOffset.toString(),
+                    'Upload-Length': session.totalSize.toString(),
+                    'Cache-Control': 'no-store'
+                }
+            });
+        }
+
+        let { fpath } = getUrl(request.url);
+        const metadata = await this.getMetadata(fpath);
+        if (metadata) {
+            const size = metadata.size ? metadata.size.toString() : '0';
+            const mimeType = metadata.mimeType || 'application/octet-stream';
+            const modifiedTime = metadata.modifiedTime ? new Date(metadata.modifiedTime).toUTCString() : new Date().toUTCString();
+            return new Response(null, {
+                status: 200,
+                headers: {
+                    'Content-Length': size,
+                    'Content-Type': mimeType,
+                    'Last-Modified': modifiedTime,
+                    'Date': modifiedTime
+                }
+            });
+        }
+        return new Response(null, { status: 404 });
+    }
+
+    async LOCK(): Promise<Response> { return new Response(null, { status: 200 }); }
+    async UNLOCK(): Promise<Response> { return new Response(null, { status: 200 }); }
+    async PROPPATCH(): Promise<Response> { return new Response(null, { status: 200 }); }
+
+    async getMetadata(path: string): Promise<any> {
+        path = path.startsWith('/') ? path : '/' + path;
+        path = path.endsWith('/') ? path : path + '/';
+        let meta = await this.cache.get(path, 'meta');
+        if (meta) return meta;
+
+        let fullpath = '/';
+        let metadata = (config.cache.meta['/'] && config.cache.meta['/'].data) || null;
+        if (!metadata) return null;
+
+        const fragments = trimString(path, '/').split('/');
+
+        for (let name of fragments) {
+            if (!name) continue;
+            fullpath += name + '/';
+            meta = await this.cache.get(fullpath, 'meta');
+            if (!meta) {
+                name = decodeURIComponent(name).replace(/\'/g, "\\'");
+                const result = await this.queryDrive({
+                    includeItemsFromAllDrives: true,
+                    supportsAllDrives: true,
+                    q: `'${metadata.id}' in parents and name = '${name}' and trashed = false`,
+                    fields: `files(id, name, mimeType, size, modifiedTime, description, iconLink, thumbnailLink, imageMediaMetadata, parents)`,
+                });
+                if (result.files && result.files.length > 0) {
+                    await this.cache.put(fullpath, result.files[0], 'meta');
+                    meta = result.files[0];
+                } else {
+                    return null;
+                }
+            }
+            metadata = meta;
+        }
+        return metadata;
+    }
+
+    async getObjects(id: string): Promise<any[]> {
+        let cachedList = await this.cache.get(id, 'objects');
+        if (cachedList) return cachedList;
+
+        let pageToken: string | undefined; const list: any[] = [];
+        const params: any = {
+            pageSize: 1000,
+            includeItemsFromAllDrives: true,
+            supportsAllDrives: true,
+            q: `'${id}' in parents and trashed = false AND name != '.password'`,
+            fields: `nextPageToken, files(id, name, mimeType, size, modifiedTime, description, iconLink, thumbnailLink, imageMediaMetadata)`,
+            orderBy: 'folder, name'
+        };
+        do {
+            if (pageToken) params.pageToken = pageToken;
+            const result = await this.queryDrive(params);
+            pageToken = result.nextPageToken;
+            if (result.files) list.push(...result.files);
+        } while (pageToken);
+
+        await this.cache.put(id, list, 'objects', 30000);
+        return list;
+    }
+
+    async getRawContent(id: string, range: string | null, abuse: boolean): Promise<Response> {
+        const headers: Record<string, string> = { Authorization: 'Bearer ' + (await this.getAccessToken()) };
+        if (range) headers['Range'] = range;
+        const url = new URL(`https://www.googleapis.com/drive/v3/files/${id}`);
+        url.searchParams.set('supportsAllDrives', 'true');
+        url.searchParams.set('alt', 'media');
+        url.searchParams.set('acknowledgeAbuse', abuse ? 'true' : 'false');
+        return await fetch(url.toString(), { headers });
+    }
+
+    async queryDrive(params: Record<string, any>, retryCount: number = 0): Promise<any> {
+        const driveUrl = 'https://www.googleapis.com/drive/v3/files?' + encodeQueryString(params);
+        const response = await fetch(driveUrl, { headers: { Authorization: 'Bearer ' + (await this.getAccessToken()) } });
+        const result: any = await response.json();
+
+        if (result.error) {
+            const errMsg = result.error.message || '';
+            if ((errMsg.includes('Rate Limit') || errMsg.includes('Quota exceeded') || response.status === 403 || response.status === 429) && retryCount < 3) {
+                await new Promise(resolve => setTimeout(resolve, 500 * Math.pow(2, retryCount)));
+                return this.queryDrive(params, retryCount + 1);
+            }
+            throw new StatusError(errMsg || 'Unknown Google Drive API Error', response.status);
+        }
+        return result;
+    }
+
+    async getQuota(): Promise<{ available: number | string; used: number | string } | undefined> {
+        const response = await fetch('https://www.googleapis.com/drive/v3/about?fields=storageQuota', { headers: { Authorization: 'Bearer ' + (await this.getAccessToken()) } });
+        const result: any = await response.json();
+        if (result.storageQuota) return { available: result.storageQuota.limit - result.storageQuota.usage, used: result.storageQuota.usage };
+    }
+
+    async getAccessToken(): Promise<string> {
+        let token = await this.cache.get('token', 'config');
+        if (token && token.expires && token.expires > Date.now()) return token.access_token;
+        if (GDrive.fetchingTokenPromise) {
+            return await GDrive.fetchingTokenPromise;
+        }
+        GDrive.fetchingTokenPromise = (async () => {
+            try {
+                const response = await fetch('https://www.googleapis.com/oauth2/v4/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: encodeQueryString({
+                        client_id: config.client_id,
+                        client_secret: config.client_secret,
+                        refresh_token: config.refresh_token,
+                        grant_type: 'refresh_token'
+                    })
+                });
+                const result: any = await response.json();
+                if (result.error) {
+                    throw new StatusError(result.error_description, response.status);
+                }
+                await this.cache.put(
+                    'token',
+                    { expires: Date.now() + 3500 * 1000, access_token: result.access_token },
+                    'config',
+                    3500 * 1000
+                );
+                return result.access_token;
+            } finally {
+                GDrive.fetchingTokenPromise = null;
+            }
+        })();
+        return await GDrive.fetchingTokenPromise;
+    }
+}
+
+function arrayToXml(rpath: string, files: Partial<DriveFile>[], cursor?: string): string {
+    let entries: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+        let file = files[i];
+        if (!file.lastmodified) file.lastmodified = new Date().toUTCString();
+        let sizeTag = !file.dir ? `<d:getcontentlength>${file.size}</d:getcontentlength>` : '<d:getcontentlength />';
+        let quotaTag = file.quota ? `<d:quota-used-bytes>${file.quota.used}</d:quota-used-bytes><d:quota-available-bytes>${file.quota.available}</d:quota-available-bytes>` : '';
+
+        let href = file.name ? pathJoin(rpath, file.name) : rpath;
+        if (file.dir && !href.endsWith('/')) href += '/';
+
+        entries.push(
+            '<d:response>', `<d:href>${encodeURI(href)}</d:href>`, '<d:propstat>', '<d:prop>',
+            `<d:getlastmodified>${file.lastmodified}</d:getlastmodified>`,
+            file.dir ? '<d:resourcetype><d:collection/></d:resourcetype>' : '<d:resourcetype />',
+            sizeTag, quotaTag,
+            '</d:prop>', '<d:status>HTTP/1.1 200 OK</d:status>', '</d:propstat>', '</d:response>'
+        );
+    }
+    let new_cursor = cursor ? `<td:cursor>${cursor}</td:cursor>` : '';
+    return `<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:R="https://www.contoso.com/schema/">${entries.join('\n')}${new_cursor}</d:multistatus>`;
+}
+
+function arrayToHtml(rpath: string, files: Partial<DriveFile>[]): string {
+    const basePath = config.path.endsWith('/') ? config.path : config.path + '/';
+    const isRoot = rpath === basePath || rpath + '/' === basePath;
+    const title = isRoot ? '' : ' - ' + rpath;
+    const tpl = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/><link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAApVBMVEUAAAD///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+4/eNVAAAANnRSTlMA9isRpA3y8NfOoQjl3amJgVcX2sm/cUAw+MO6s5ttOhsU+urfrZB6dWZQRCPSlUsyBeueYCQaPAIhAAABdUlEQVQ4y23S2WKCQAwF0EsRkMWyivvWqrVqF7vc//+0mjhQRM9TkoEZJgENi/l34bp+UB5wx6n0WesmDlrSiFe+XnEl0OoTG6bNTcZUh4eLF81yG5VCC7vZtCp0tdALTdrR1AK4N5UhVR9qT5UCCXH1DktNXI0LCbnFRTiiks+YUx2lfuAKqqrG57Cn0QzKL2CsteyFWGgwcszWHOBiQLVHSVH3bdSrook5Y6Y3bnT0w4SZuamOaGGKD+f4GUYsKxGk/3UH9emkyjxpnz5Q3S2lyhrfaUnbX2Dwws9WK9t2HPTliOD/0He6lmCe592zN58cY0drUU1o4NgiO098OPz8/J2SWzkogvI2uBZ6OsKI3En6SrSMScsB5PeRRnPeWv+QEZnJboDARcszyaUEPxpw2FpPtGfVWMb9bWt9SfLNxCf5JTadThB0xKNak14Gw855h3dEzZnwRrFEU2m11hO0ZHHU2P39iFthGk96rrvux6mN2h80rVPh8HjxPAAAAABJRU5ErkJggg=="/><title>${config.name}{{title}}</title><style>*{box-sizing:border-box}body{font:15px/1.3 Helvetica,Arial;background:#0E1117;color:#CAD1D9}h1,main{background:#0E1117;max-width:960px;margin:10px auto;border-radius:5px}h1{font-size:18px;padding:15px;border:#22262D 1px solid;color:#DDD;background:#171b22}a{color:inherit;text-decoration:none}h1 a,main a{display:flex;align-items:center}main a:first-child{border-top-left-radius:5px;border-top-right-radius:5px}main a:last-child{border-bottom-left-radius:5px;border-bottom-right-radius:5px}svg{margin-right:15px;fill:#F1F6FC}h1:hover{color:#BABBBD}main{border:#22262D 1px solid}main img{margin-right:10px}main a{padding:12px 15px;border-bottom:#22262D 1px solid;transition:all .3s}main a:last-child{border:0}main a:hover{background:#171B22;color:#58a6ff}main a>div{margin-left:10px}main a>div:first-child{flex:1;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center}main a>div:not(:first-child){color:#8C949E;font-size:13px}footer{text-align:center;color:#8C949E;font-size:13px}footer a:hover{text-decoration:underline}@media (max-width:640px){main a>div:last-child{display:none}}</style></head><body><h1><a href="${basePath}"><svg width="32" height="32" viewBox="0 0 320 320"><path d="M95 304 c-47 -24 -71 -51 -84 -95 -26 -87 20 -173 107 -199 145 -44 262 135 165 251 -48 56 -128 75 -188 43z m168 -73 c9 -16 17 -32 17 -35 0 -3 -35 -6 -78 -6 -85 0 -78 -4 -110 63 -2 4 32 7 75 7 76 0 79 -1 96 -29z m-149 -46 c38 -65 38 -65 16 -100 -22 -36 -22 -36 -62 32 -40 68 -40 68 -22 101 9 17 20 32 23 32 4 0 24 -29 45 -65z m166 -9 c0 -12 -75 -129 -86 -133 -7 -2 -26 -3 -42 -1 -30 3 -30 3 9 71 39 65 41 67 79 67 22 0 40 -2 40 -4z" /></svg>${config.name}</a></h1><main>{{content}}</main><footer><a target="_blank" href="${config.copyright_link}">${config.copyright}</a></footer></body></html>`;
+    let frag: string[] = [];
+    if (!isRoot) frag.push(`<a href="../"><div><img src="/_/16/type/application/vnd.google-apps.folder"><b>../</b></div></a>`);
+    if (files) {
+        for (let i = 0; i < files.length; i++) {
+            let entry = files[i];
+            let iconLink = entry.iconLink ? entry.iconLink.replace('https://drive-thirdparty.googleusercontent.com/', '/_/') : '';
+            let modTime = entry.lastmodified ? `<div>${new Date(entry.lastmodified).toISOString().split('T')[0]}</div>` : '';
+            if (entry.dir) {
+                frag.push(`<a href="${entry.name}/"><div><img src="${iconLink}"/><b>${entry.name}</b></div>${modTime}</a>`);
+            } else {
+                frag.push(`<a href="${entry.name}" target="_blank"><div><img src="${iconLink}"/>${entry.name}</div><div>${formatSize(entry.size || 0)}</div>${modTime}</a>`);
+            }
+        }
+    }
+    return tpl.trim().replace(/{{content}}/, frag.join('')).replace(/{{title}}/, title);
+}
+
+export default {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        const { protocol, pathname } = new URL(request.url);
+        let method = request.method.toUpperCase();
+
+        if (pathname === '/robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200 });
+        if (pathname === '/favicon.ico') return new Response(null, { status: 204 });
+        if (pathname.indexOf('/desktop.ini') !== -1) return new Response(null, { status: 404 });
+
+        try {
+            // Static
+            if (pathname.startsWith('/_/')) {
+                let url = new URL(request.url); url.hostname = 'drive-thirdparty.googleusercontent.com'; url.pathname = url.pathname.slice(2);
+                let response = await fetch(new Request(url.toString(), request));
+                response = new Response(response.body, response);
+                response.headers.set('Access-Control-Allow-Origin', '*');
+                response.headers.set('Cache-Control', 'public, max-age=16768000');
+                return response;
+            }
+
+            let basePath = config.path.endsWith('/') ? config.path : config.path + '/';
+            if (basePath !== '/') {
+                if (pathname + '/' === basePath) {
+                    return Response.redirect(request.url + '/', 301);
+                }
+                if (!pathname.startsWith(basePath)) {
+                    return new Response('404 Not Found', { status: 404 });
+                }
+            }
+
+            // Env
+            if (env && !config.env) {
+                if (env.USERS) {
+                    if (typeof env.USERS === 'string') {
+                        try {
+                            const users = JSON.parse(env.USERS);
+                            if (users) config.users = users;
+                        } catch (error) {
+                            console.log(error);
+                        }
+                    } else if (typeof env.USERS === 'object') {
+                        config.users = env.USERS as Record<string, string>;
+                    }
+                }
+                if (env.CLIENT_ID) config.client_id = env.CLIENT_ID;
+                if (env.CLIENT_SECRET) config.client_secret = env.CLIENT_SECRET;
+                if (env.REFRESH_TOKEN) config.refresh_token = env.REFRESH_TOKEN;
+                if (env.ROOT_ID) config.cache.meta['/']!.data.id = env.ROOT_ID;
+                if (env.PATH) config.path = env.PATH;
+                if (env.NAME) config.name = env.NAME;
+                if (env.COPYRIGHT) config.copyright = env.COPYRIGHT;
+                if (env.COPYRIGHT_LINK) config.copyright_link = env.COPYRIGHT_LINK;
+                config.env = true;
+            }
+
+            // Global Basic Authentication
+            if (!request.headers.has('Authorization')) {
+                return new Response('Authentication Required.', {
+                    status: 401,
+                    headers: { 'WWW-Authenticate': `Basic realm="${config.name}", charset="UTF-8"` }
+                });
+            }
+
+            const auth = basicAuthentication(request);
+            if (!auth || !config.users[auth.user] || config.users[auth.user] !== auth.pass) {
+                return new Response('Unauthorized', { status: 401 });
+            }
+
+            const drive = new GDrive(env, ctx);
+
+            // Method Routing
+            if (method === 'PATCH' && !pathname.includes('/tus_uploads/')) {
+                method = 'COPY';
+            }
+
+            if (typeof (drive as any)[method] === 'function') {
+                return await (drive as any)[method](request);
+            }
+
+            return new Response('Method Not Allowed', { status: 405 });
+
+        } catch (e: any) {
+            const status = e.status || e.code || 500;
+            return new Response(status + ': ' + e.message, { status });
+        }
+    }
+};

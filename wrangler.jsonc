@@ -1,0 +1,16 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gdrive-cloudflare",
+	"main": "src/worker.ts",
+	"compatibility_date": "2026-04-15",
+	"upload_source_maps": false,
+	"send_metrics": false,
+	"keep_names": false,
+	"minify": true,
+	"kv_namespaces": [
+		{
+			"binding": "KV",
+			"id": "c2783d69b74a4ee7ac6713907edfcbd8"
+		}
+	]
+}
